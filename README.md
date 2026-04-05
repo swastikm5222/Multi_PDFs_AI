@@ -5,17 +5,18 @@ Meet MultiPDF Chat AI App! 🚀 Chat seamlessly with Multiple PDFs using Langcha
 ## 📝 Description
 The Multi-PDF's Chat Agent is a Streamlit-based web application designed to facilitate interactive conversations with a chatbot. The app allows users to upload multiple PDF documents, extract text information from them, and train a chatbot using this extracted content. Users can then engage in real-time conversations with the chatbot.
 
+![Project Overview](img/Robot.jpg)
+
 ## 📢Demo App with Streamlit Cloud (Visualize only)
 
 [Launch App On Streamlit](https://multi-pdfschatappai-agent.streamlit.app/)
 
 ## 💻 Demo:
-![Demo 1: Chatbot Output](img/LLMframework.jpg)
+![Demo 1: Application Preview](img/app-preview.png)
 
 ## 🎯 How It Works:
 ------------
 
-![MultiPDF Chat App Diagram](img/Architecture.jpg)
 
 The application follows these steps to provide responses to your questions:
 
@@ -29,7 +30,6 @@ The application follows these steps to provide responses to your questions:
 
 5. **Response Generation** : The selected chunks are passed to the language model, which generates a response based on the relevant content of the PDFs.
 
-![Demo 2: Chatbot Output](img/LLMApp.jpg)
 
 --- 
 ## 🎯 Key Features
@@ -43,7 +43,7 @@ The application follows these steps to provide responses to your questions:
 - **LLM Model Compatibility**: Supports Google Gemini Pro, OpenAI GPT 3, Anthropic Claude, Llama2 and other open-source LLMs.
 
 
-![Demo 3: Chatbot Output](img/LLMAgents.jpg)
+![Key Features Preview](img/chat-preview.png)
 
 
 ## 🌟Requirements
@@ -56,7 +56,6 @@ The application follows these steps to provide responses to your questions:
 - **faiss-cpu** : FAISS (Facebook AI Similarity Search) is a library developed by Facebook for efficient similarity search, Machine Learning Embeddings,Information Retrieval, content-based filtering and clustering of dense vectors.
 - **langchain_google_genai** : It is a package that provides an integration between LangChain and Google’s generative-ai SDK. It contains classes that extend the Embeddings class and provide methods for generating embeddings. The package can be used in a multipdf chatbot application to extract textual data from PDF documents and generate Accurate responses to user queries.
 
-![Demo 4: Chatbot Output](img/CALMOutput.jpg)
 ---
 
 ## ▶️Installation
