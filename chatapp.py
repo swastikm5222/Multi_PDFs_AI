@@ -2,28 +2,63 @@ import html
 import json
 import os
 import re
+import socket
+from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from langchain_community.vectorstores import FAISS
-from langchain_classic.chains.question_answering import load_qa_chain
-from langchain_classic.prompts import PromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+INDEX_DIR = BASE_DIR / "faiss_index"
+MANIFEST_PATH = INDEX_DIR / "manifest.json"
+ROBOT_IMAGE_PATH = BASE_DIR / "img" / "Robot.jpg"
+
+load_dotenv(BASE_DIR / ".env")
 
 DEFAULT_CHAT_MODEL = os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")
 DEFAULT_EMBEDDING_MODEL = os.getenv(
     "GOOGLE_EMBEDDING_MODEL",
     "models/gemini-embedding-001",
 )
-
-INDEX_DIR = "faiss_index"
 INDEX_FILES = ("index.faiss", "index.pkl")
-MANIFEST_PATH = os.path.join(INDEX_DIR, "manifest.json")
+LOCAL_RETRIEVAL_LIMIT = 4
+MAX_LOCAL_ANSWER_CHARS = 1800
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "this",
+    "to",
+    "was",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+}
 
 
 def inject_styles():
@@ -247,6 +282,18 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def get_google_api_key() -> str:
+    return os.getenv("GOOGLE_API_KEY", "").strip()
+
+
+def is_google_api_key_configured() -> bool:
+    return bool(get_google_api_key())
+
+
+def has_vector_index() -> bool:
+    return all((INDEX_DIR / filename).exists() for filename in INDEX_FILES)
+
+
 def resolve_embedding_model() -> str:
     configured_model = DEFAULT_EMBEDDING_MODEL.strip()
     legacy_aliases = {
@@ -275,27 +322,39 @@ def extract_pdf_pages(pdf_docs):
     return pages
 
 
-def get_text_chunks(pages):
+def get_chunk_records(pages):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=50000,
         chunk_overlap=1000,
     )
 
-    texts = []
-    metadatas = []
+    chunks = []
     for page in pages:
         for chunk in splitter.split_text(page["text"]):
             chunk = chunk.strip()
             if not chunk:
                 continue
-            texts.append(chunk)
-            metadatas.append(
+            chunks.append(
                 {
+                    "text": chunk,
                     "source": page["source"],
                     "page_number": page["page_number"],
                 }
             )
-    return texts, metadatas
+    return chunks
+
+
+def get_text_chunks(pages):
+    chunks = get_chunk_records(pages)
+    texts = [chunk["text"] for chunk in chunks]
+    metadatas = [
+        {
+            "source": chunk["source"],
+            "page_number": chunk["page_number"],
+        }
+        for chunk in chunks
+    ]
+    return texts, metadatas, chunks
 
 
 @st.cache_resource(show_spinner=False)
@@ -303,29 +362,105 @@ def get_embeddings():
     return GoogleGenerativeAIEmbeddings(model=resolve_embedding_model())
 
 
-def save_knowledge_base(pages):
-    texts, metadatas = get_text_chunks(pages)
-    embeddings = get_embeddings()
-    vector_store = FAISS.from_texts(texts, embedding=embeddings, metadatas=metadatas)
+def clear_vector_index():
+    INDEX_DIR.mkdir(exist_ok=True)
+    for filename in INDEX_FILES:
+        path = INDEX_DIR / filename
+        if path.exists():
+            path.unlink()
 
-    os.makedirs(INDEX_DIR, exist_ok=True)
-    vector_store.save_local(INDEX_DIR)
+
+def save_manifest(pages, chunks, retrieval_mode, build_warning=None):
+    INDEX_DIR.mkdir(exist_ok=True)
     with open(MANIFEST_PATH, "w", encoding="utf-8") as manifest_file:
         json.dump(
-            {"pages": pages, "chunk_count": len(texts)},
+            {
+                "pages": pages,
+                "chunks": chunks,
+                "chunk_count": len(chunks),
+                "retrieval_mode": retrieval_mode,
+                "build_warning": build_warning,
+            },
             manifest_file,
             ensure_ascii=False,
             indent=2,
         )
 
 
+def explain_runtime_error(exc: Exception, phase: str) -> str:
+    message = normalize_text(str(exc) or exc.__class__.__name__)
+    lowered = message.lower()
+
+    if (
+        isinstance(exc, socket.gaierror)
+        or "getaddrinfo failed" in lowered
+        or "name resolution" in lowered
+        or "nodename nor servname provided" in lowered
+    ):
+        return (
+            f"network or DNS lookup failed while contacting Gemini during {phase}. "
+            "Check your internet connection, VPN, proxy, firewall, or DNS settings."
+        )
+
+    if "api key" in lowered or "permission denied" in lowered or "403" in lowered:
+        return (
+            f"Gemini rejected the request during {phase}. Verify that GOOGLE_API_KEY is "
+            "present and valid, then try again."
+        )
+
+    if "429" in lowered or "quota" in lowered or "rate limit" in lowered:
+        return (
+            f"Gemini rate limited the request during {phase}. Wait a bit and try again."
+        )
+
+    if "timeout" in lowered or "timed out" in lowered or "deadline exceeded" in lowered:
+        return f"Gemini timed out during {phase}. Try again when the network is stable."
+
+    return f"Gemini was unavailable during {phase}: {message}"
+
+
+def build_knowledge_base(pages):
+    texts, metadatas, chunks = get_text_chunks(pages)
+    if not texts:
+        raise ValueError("No extractable text was found in the uploaded PDFs.")
+
+    retrieval_mode = "keyword"
+    build_warning = None
+
+    if is_google_api_key_configured():
+        try:
+            embeddings = get_embeddings()
+            vector_store = FAISS.from_texts(texts, embedding=embeddings, metadatas=metadatas)
+            INDEX_DIR.mkdir(exist_ok=True)
+            vector_store.save_local(str(INDEX_DIR))
+            retrieval_mode = "semantic"
+        except Exception as exc:
+            clear_vector_index()
+            build_warning = explain_runtime_error(exc, "knowledge-base creation")
+    else:
+        clear_vector_index()
+        build_warning = (
+            "GOOGLE_API_KEY is not configured. The app created a local keyword index "
+            "instead of Gemini-powered semantic search."
+        )
+
+    save_manifest(pages, chunks, retrieval_mode, build_warning)
+    return {
+        "page_count": len(pages),
+        "chunk_count": len(chunks),
+        "retrieval_mode": retrieval_mode,
+        "build_warning": build_warning,
+    }
+
+
 def get_knowledge_signature():
-    file_paths = [os.path.join(INDEX_DIR, filename) for filename in INDEX_FILES]
-    if not all(os.path.exists(path) for path in file_paths):
+    if not MANIFEST_PATH.exists():
         return None
 
-    signature = [os.path.getmtime(path) for path in file_paths]
-    signature.append(os.path.getmtime(MANIFEST_PATH) if os.path.exists(MANIFEST_PATH) else 0)
+    signature = [MANIFEST_PATH.stat().st_mtime]
+    for filename in INDEX_FILES:
+        path = INDEX_DIR / filename
+        signature.append(path.stat().st_mtime if path.exists() else 0)
     return tuple(signature)
 
 
@@ -333,7 +468,7 @@ def get_knowledge_signature():
 def load_vector_store(signature):
     embeddings = get_embeddings()
     return FAISS.load_local(
-        INDEX_DIR,
+        str(INDEX_DIR),
         embeddings,
         allow_dangerous_deserialization=True,
     )
@@ -341,36 +476,181 @@ def load_vector_store(signature):
 
 @st.cache_data(show_spinner=False)
 def load_manifest(signature):
-    if not os.path.exists(MANIFEST_PATH):
+    if not MANIFEST_PATH.exists():
         return {"pages": []}
     with open(MANIFEST_PATH, "r", encoding="utf-8") as manifest_file:
-        return json.load(manifest_file)
+        manifest = json.load(manifest_file)
+    manifest.setdefault("chunks", [])
+    manifest.setdefault("retrieval_mode", "keyword")
+    manifest.setdefault("build_warning", None)
+    return manifest
 
 
 @st.cache_resource(show_spinner=False)
-def get_conversational_chain():
-    prompt_template = """
-    Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
-    provided context just say, "answer is not available in the context", don't provide the wrong answer
+def get_conversational_model():
+    return ChatGoogleGenerativeAI(
+        model=DEFAULT_CHAT_MODEL,
+        temperature=0.3,
+    )
+
+
+def format_docs_for_prompt(docs) -> str:
+    return "\n\n".join(
+        (
+            f"Source: {doc.metadata.get('source', 'Uploaded PDF')} | "
+            f"Page: {doc.metadata.get('page_number', '?')}\n"
+            f"{doc.page_content}"
+        )
+        for doc in docs
+    )
+
+
+def response_content_to_text(content) -> str:
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and "text" in item:
+                parts.append(str(item["text"]))
+            else:
+                parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+
+    return str(content)
+
+
+def answer_with_gemini(question: str, docs) -> str:
+    prompt = f"""
+    Answer the question as detailed as possible from the provided context. If the answer is not in the
+    provided context, say "answer is not available in the context" and do not make up information.
 
     Context:
-    {context}
+    {format_docs_for_prompt(docs)}
 
     Question:
     {question}
 
     Answer:
     """
+    response = get_conversational_model().invoke(prompt)
+    return finalize_answer(response_content_to_text(response.content))
 
-    model = ChatGoogleGenerativeAI(
-        model=DEFAULT_CHAT_MODEL,
-        temperature=0.3,
+
+def tokenize(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-zA-Z0-9]+", text.lower())
+        if len(token) > 1 and token not in STOPWORDS
+    }
+
+
+def extract_requested_page_numbers(question: str) -> set[int]:
+    return {int(match) for match in re.findall(r"\bpage\s+(\d+)\b", question.lower())}
+
+
+def sentence_split(text: str) -> list[str]:
+    sentences = [normalize_text(part) for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+    return sentences or [normalize_text(text)]
+
+
+def select_best_sentences(question: str, text: str, limit: int) -> list[str]:
+    question_tokens = tokenize(question)
+    sentences = sentence_split(text)
+    ranked_sentences = []
+
+    for index, sentence in enumerate(sentences):
+        sentence_tokens = tokenize(sentence)
+        score = len(question_tokens & sentence_tokens) * 10
+        if question_tokens and question.lower() in sentence.lower():
+            score += 8
+        if index == 0:
+            score += 1
+        ranked_sentences.append((score, index, sentence))
+
+    best = sorted(ranked_sentences, key=lambda item: (-item[0], item[1]))[:limit]
+    best_indexes = {index for _, index, _ in best}
+    return [sentence for index, sentence in enumerate(sentences) if index in best_indexes]
+
+
+def retrieve_local_matches(question: str, signature, limit: int = LOCAL_RETRIEVAL_LIMIT) -> list[dict]:
+    manifest = load_manifest(signature)
+    chunks = manifest.get("chunks") or get_chunk_records(manifest.get("pages", []))
+    if not chunks:
+        return []
+
+    question_lower = question.lower()
+    question_tokens = tokenize(question)
+    requested_pages = extract_requested_page_numbers(question)
+    ranked = []
+
+    for index, chunk in enumerate(chunks):
+        chunk_tokens = tokenize(chunk["text"])
+        score = len(question_tokens & chunk_tokens) * 5
+
+        if question_lower and question_lower in chunk["text"].lower():
+            score += 10
+
+        if requested_pages and chunk["page_number"] in requested_pages:
+            score += 25
+
+        ranked.append((score, index, chunk))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    matches = [chunk for score, _, chunk in ranked if score > 0][:limit]
+
+    if not matches and requested_pages:
+        matches = [chunk for chunk in chunks if chunk["page_number"] in requested_pages][:limit]
+
+    if not matches:
+        matches = [chunk for _, _, chunk in ranked[:limit]]
+
+    return matches
+
+
+def docs_to_chunk_records(docs) -> list[dict]:
+    return [
+        {
+            "text": doc.page_content,
+            "source": doc.metadata.get("source", "Uploaded PDF"),
+            "page_number": doc.metadata.get("page_number", "?"),
+        }
+        for doc in docs
+    ]
+
+
+def build_local_fallback_answer(question: str, matches: list[dict], reason: str | None = None) -> str:
+    if not matches:
+        return "answer is not available in the context"
+
+    wants_summary = any(word in question.lower() for word in ("summary", "summarize", "overview", "gist"))
+    selected_sentences = []
+    seen_sentences = set()
+
+    for index, chunk in enumerate(matches):
+        limit = 2 if wants_summary or index == 0 else 1
+        for sentence in select_best_sentences(question, chunk["text"], limit=limit):
+            if sentence not in seen_sentences:
+                selected_sentences.append(sentence)
+                seen_sentences.add(sentence)
+
+    answer_text = " ".join(selected_sentences).strip() or matches[0]["text"].strip()
+    if len(answer_text) > MAX_LOCAL_ANSWER_CHARS:
+        answer_text = answer_text[: MAX_LOCAL_ANSWER_CHARS - 3].rstrip() + "..."
+
+    sources = "\n".join(
+        f"- {match['source']} (page {match['page_number']})" for match in matches[:3]
     )
-    prompt = PromptTemplate(
-        template=prompt_template,
-        input_variables=["context", "question"],
-    )
-    return load_qa_chain(model, chain_type="stuff", prompt=prompt)
+
+    if reason:
+        note = f"\n\n_Local fallback used because {reason}._"
+    else:
+        note = "\n\n_Local keyword retrieval mode._"
+
+    return f"{answer_text}\n\n**Sources**\n{sources}{note}"
 
 
 def finalize_answer(answer: str) -> str:
@@ -384,18 +664,23 @@ def finalize_answer(answer: str) -> str:
 
 @st.cache_data(show_spinner=False, ttl=600)
 def get_answer_for_question(signature, question: str) -> str:
-    vector_store = load_vector_store(signature)
-    docs = vector_store.similarity_search(question)
+    local_matches = retrieve_local_matches(question, signature)
 
-    if not docs:
-        return "answer is not available in the context"
+    if has_vector_index():
+        try:
+            vector_store = load_vector_store(signature)
+            docs = vector_store.similarity_search(question)
+            if docs:
+                try:
+                    return answer_with_gemini(question, docs)
+                except Exception as exc:
+                    reason = explain_runtime_error(exc, "answer generation").lower()
+                    return build_local_fallback_answer(question, docs_to_chunk_records(docs), reason)
+        except Exception as exc:
+            reason = explain_runtime_error(exc, "vector search").lower()
+            return build_local_fallback_answer(question, local_matches, reason)
 
-    chain = get_conversational_chain()
-    response = chain(
-        {"input_documents": docs, "question": question},
-        return_only_outputs=True,
-    )
-    return finalize_answer(response.get("output_text", ""))
+    return build_local_fallback_answer(question, local_matches)
 
 
 def ask_question(question: str) -> str:
@@ -438,8 +723,8 @@ def render_hero():
 
 def render_sidebar():
     with st.sidebar:
-        if os.path.exists("img/Robot.jpg"):
-            st.image("img/Robot.jpg", use_container_width=True)
+        if ROBOT_IMAGE_PATH.exists():
+            st.image(str(ROBOT_IMAGE_PATH), use_container_width=True)
 
         st.markdown(
             """
@@ -470,12 +755,50 @@ def render_sidebar():
                         if not pages:
                             st.error("No extractable text was found in the uploaded PDFs.")
                         else:
-                            save_knowledge_base(pages)
-                            st.success(
-                                f"Knowledge base created successfully for {len(pdf_docs)} file(s) and {len(pages)} page(s)."
-                            )
+                            result = build_knowledge_base(pages)
+                            if result["retrieval_mode"] == "semantic":
+                                st.success(
+                                    f"Knowledge base created successfully for {len(pdf_docs)} file(s), "
+                                    f"{result['page_count']} page(s), and {result['chunk_count']} chunk(s). "
+                                    "Gemini semantic search is ready."
+                                )
+                            else:
+                                st.warning(
+                                    f"Knowledge base created in local keyword mode for {len(pdf_docs)} file(s), "
+                                    f"{result['page_count']} page(s), and {result['chunk_count']} chunk(s). "
+                                    "The app will still answer questions, but semantic search is unavailable."
+                                )
+                                if result["build_warning"]:
+                                    st.caption(result["build_warning"])
                     except Exception as exc:
                         st.error(f"Processing failed: {exc}")
+
+        signature = get_knowledge_signature()
+        if signature:
+            manifest = load_manifest(signature)
+            mode = manifest.get("retrieval_mode", "keyword")
+            mode_title = "Semantic Search Active" if mode == "semantic" else "Local Keyword Mode"
+            mode_copy = (
+                "Gemini embeddings and semantic retrieval are available for higher-quality matching."
+                if mode == "semantic"
+                else "The app is using a local keyword index. It stays usable even when Gemini or the network is unavailable."
+            )
+            st.markdown(
+                f"""
+                <div class="sidebar-card" style="margin-top: 1rem;">
+                    <div class="sidebar-title">{mode_title}</div>
+                    <p class="sidebar-copy">{mode_copy}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if manifest.get("build_warning"):
+                st.caption(manifest["build_warning"])
+        elif not is_google_api_key_configured():
+            st.info(
+                "Add GOOGLE_API_KEY to enable Gemini-powered semantic search. "
+                "Without it, the app can still run in local keyword mode."
+            )
 
         st.markdown(
             """

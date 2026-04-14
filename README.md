@@ -62,7 +62,7 @@ The application follows these steps to provide responses to your questions:
 
 Clone the repository:
 
-`git clone https://github.com/GURPREETKAURJETHRA/Multi-PDFs_ChatApp_AI-Agent.git`
+`git clone https://github.com/swastikm5222/Multi_PDFs_AI.git`
 
 Install the required Python packages:
 
@@ -70,11 +70,13 @@ Install the required Python packages:
 
 Set up your Google API key from `https://makersuite.google.com/app/apikey` by creating a .env file in the root directory of the project with the following contents:
 
-`GOOGLE_API_KEY =<your-api-key-here>`
+`GOOGLE_API_KEY=<your-api-key-here>`
 
 Run the Streamlit app:
 
-`streamlit run app.py`
+`streamlit run chatapp.py`
+
+If Gemini is unavailable because of an API, quota, or network issue, the app now falls back to a local keyword-based mode instead of failing completely. Semantic search works best when Gemini is available, but the app remains usable without it.
 
 ---
 ## 💡Usage
@@ -84,9 +86,9 @@ To use the Multi-PDF-s 📚ChatApp AI Agent 🤖, U can have glimpse of look by 
 In case You want to run & implement project on your system then follow these steps:
 
 1. Ensure that you have installed the required dependencies and added the **Google API key to the `.env` file** (MUST).
-2. Run the `app.py` file using the Streamlit CLI. Execute the following command:
+2. Run the `chatapp.py` file using the Streamlit CLI. Execute the following command:
    ```
-   streamlit run app.py
+   streamlit run chatapp.py
    ```
 3. The application will launch in your default web browser, displaying the user interface.
 4. Upload multiple PDF documents into the app by following the provided instructions at sidebar. On the sidebar, you'll find an option to upload PDF documents. Click on the "Upload your documents here and click on Process" button and select one or more PDF files. 
